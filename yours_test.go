@@ -283,6 +283,58 @@ func TestConcurrentClerks(t *testing.T) {
 }
 
 /*
+Step 6: call ForwardOp on a backup directly.  The write shows up in
+the backup's store, a late re-sent forward does not roll it back, and
+ForwardOp returns ErrNetwork after Kill.
+*/
+func TestForwardOpDirect(t *testing.T) {
+	addr := "127.0.0.1:21301"
+	kv := startServer(t, addr, "")
+
+	client, err := rpc.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+
+	forward := func(key, value string, xid Xid) Err {
+		t.Helper()
+		var r ForwardReply
+		args := ForwardArgs{Key: key, Value: value, Op: OpPut, Xid: xid}
+		if err := client.Call("KVServer.ForwardOp", args, &r); err != nil {
+			t.Fatalf("ForwardOp(%s,%s,xid=%d): %v", key, value, xid, err)
+		}
+		return r.Err
+	}
+	get := func(key string, xid Xid) string {
+		t.Helper()
+		var r GetReply
+		if err := client.Call("KVServer.Get", GetArgs{Key: key, Xid: xid}, &r); err != nil {
+			t.Fatalf("Get(%s): %v", key, err)
+		}
+		return r.Value
+	}
+
+	if e := forward("x", "1", 5); e != OK {
+		t.Fatalf("ForwardOp xid=5 Err = %v, want OK", e)
+	}
+	if e := forward("x", "2", 6); e != OK {
+		t.Fatalf("ForwardOp xid=6 Err = %v, want OK", e)
+	}
+	if e := forward("x", "1", 5); e != OK {
+		t.Fatalf("re-sent ForwardOp xid=5 Err = %v, want cached OK", e)
+	}
+	if got := get("x", 7); got != "2" {
+		t.Fatalf("after re-sent forward, x = %q, want \"2\"", got)
+	}
+
+	kv.Kill()
+	if e := forward("y", "1", 8); e != ErrNetwork {
+		t.Fatalf("ForwardOp after Kill Err = %v, want ErrNetwork", e)
+	}
+}
+
+/*
 A smoke test.  Starts a single KVServer (no backup), writes a key,
 reads it back, and checks the value.  Passes once Part 1 is done.
 */

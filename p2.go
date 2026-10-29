@@ -146,8 +146,24 @@ client operation.  The backup applies the operation (respecting
 at-most-once) and returns OK.
 */
 func (kv *KVServer) ForwardOp(args ForwardArgs, reply *ForwardReply) error {
-	/* ADD YOUR CODE HERE */
-	panic("not implemented yet")
+	if kv.isDead() {
+		reply.Err = ErrNetwork
+		return nil
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	/* args.Xid is the client's original Xid, so a re-sent forward is caught here. */
+	if r, ok := kv.lookupDup(args.Xid); ok {
+		reply.Err = r.Err
+		return nil
+	}
+
+	kv.store[args.Key] = args.Value
+	reply.Err = OK
+	kv.dedup[args.Xid] = cachedReply{Err: reply.Err}
+	return nil
 }
 
 /* ========================================================================
