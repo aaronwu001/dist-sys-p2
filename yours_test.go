@@ -16,8 +16,11 @@ it.  Then you never chase the same bug twice.
 package main
 
 import (
+	"fmt"
 	"net"
 	"net/rpc"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -232,6 +235,50 @@ func TestTwoClerksNoXidClash(t *testing.T) {
 	a.Put("y", "a2")
 	if got := b.Get("y"); got != "a2" {
 		t.Fatalf("after a.Put, b.Get(y) = %q, want \"a2\"", got)
+	}
+}
+
+/*
+Many clerks, plus several goroutines sharing one clerk, all hit one
+server at once.  Each goroutine owns a key and checks that every Get
+sees its own latest Put.  Run with -race.
+*/
+func TestConcurrentClerks(t *testing.T) {
+	addr := "127.0.0.1:21204"
+	startServer(t, addr, "")
+
+	const nClerks = 8 /* goroutines with their own clerk */
+	const nShared = 4 /* goroutines sharing one clerk */
+	const nOps = 100
+
+	shared := MakeClerk(addr)
+	errs := make(chan string, nClerks+nShared)
+	var wg sync.WaitGroup
+
+	worker := func(ck *Clerk, key string) {
+		defer wg.Done()
+		for i := 0; i < nOps; i++ {
+			want := strconv.Itoa(i)
+			ck.Put(key, want)
+			if got := ck.Get(key); got != want {
+				errs <- fmt.Sprintf("%s: Get = %q, want %q", key, got, want)
+				return
+			}
+		}
+	}
+
+	for i := 0; i < nClerks; i++ {
+		wg.Add(1)
+		go worker(MakeClerk(addr), "own"+strconv.Itoa(i))
+	}
+	for i := 0; i < nShared; i++ {
+		wg.Add(1)
+		go worker(shared, "shared"+strconv.Itoa(i))
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }
 
