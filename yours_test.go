@@ -335,6 +335,82 @@ func TestForwardOpDirect(t *testing.T) {
 }
 
 /*
+directGet reads key straight from the server at addr (bypassing the
+Clerk), e.g. to inspect the backup's state.
+*/
+func directGet(t *testing.T, addr, key string, xid Xid) string {
+	t.Helper()
+	client, err := rpc.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial %s: %v", addr, err)
+	}
+	defer client.Close()
+	var r GetReply
+	if err := client.Call("KVServer.Get", GetArgs{Key: key, Xid: xid}, &r); err != nil {
+		t.Fatalf("Get(%s) on %s: %v", key, addr, err)
+	}
+	return r.Value
+}
+
+/*
+Step 7: once Clerk.Put returns, the backup already has the write.
+*/
+func TestPrimaryForwardsToBackup(t *testing.T) {
+	backupAddr := "127.0.0.1:21401"
+	primaryAddr := "127.0.0.1:21402"
+	startServer(t, backupAddr, "")
+	startServer(t, primaryAddr, backupAddr)
+
+	ck := MakeClerk(primaryAddr)
+	ck.Put("k", "v1")
+	if got := directGet(t, backupAddr, "k", 1); got != "v1" {
+		t.Fatalf("backup k = %q, want \"v1\"", got)
+	}
+	ck.Put("k", "v2")
+	if got := directGet(t, backupAddr, "k", 2); got != "v2" {
+		t.Fatalf("backup k = %q, want \"v2\"", got)
+	}
+	if got := ck.Get("k"); got != "v2" {
+		t.Fatalf("primary k = %q, want \"v2\"", got)
+	}
+}
+
+/*
+While the backup is not up, the primary keeps retrying ForwardOp and
+does not reply to the clerk.  Once the backup starts, Put finishes and
+the backup has the write.
+*/
+func TestPrimaryWaitsForBackupAck(t *testing.T) {
+	backupAddr := "127.0.0.1:21403"
+	primaryAddr := "127.0.0.1:21404"
+	startServer(t, primaryAddr, backupAddr)
+
+	ck := MakeClerk(primaryAddr)
+	done := make(chan struct{})
+	go func() {
+		ck.Put("k", "v")
+		close(done)
+	}()
+
+	time.Sleep(200 * time.Millisecond) /* primary is failing to reach backup */
+	select {
+	case <-done:
+		t.Fatalf("Put returned before the backup acked")
+	default:
+	}
+
+	startServer(t, backupAddr, "")
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Put did not finish after the backup started")
+	}
+	if got := directGet(t, backupAddr, "k", 1); got != "v" {
+		t.Fatalf("backup k = %q, want \"v\"", got)
+	}
+}
+
+/*
 A smoke test.  Starts a single KVServer (no backup), writes a key,
 reads it back, and checks the value.  Passes once Part 1 is done.
 */

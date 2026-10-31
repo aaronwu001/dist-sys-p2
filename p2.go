@@ -40,11 +40,13 @@ type KVServer struct {
 
 	store map[string]string    /* key -> value, guarded by mu */
 	dedup map[Xid]cachedReply /* xid -> reply already sent, guarded by mu */
+
+	backupClient *rpc.Client /* primary only: cached connection to backup; nil until first use, guarded by mu */
 }
 
 /*
-cachedReply is what the dedup table remembers for one Xid.  Get uses
-both fields; Put and ForwardOp only use Err.
+cachedReply is what the dedup table remembers for one Xid.  
+Get uses both fields; Put and ForwardOp only use Err.
 */
 type cachedReply struct {
 	Err   Err
@@ -130,6 +132,16 @@ func (kv *KVServer) Put(args PutAppendArgs, reply *PutAppendReply) error {
 	}
 
 	kv.store[args.Key] = args.Value
+
+	if kv.backup != "" {
+		fargs := ForwardArgs{Key: args.Key, Value: args.Value, Op: args.Op, Xid: args.Xid}
+		if !kv.forwardToBackup(fargs) {
+			/* killed while waiting for the backup; not recorded, so not acked */
+			reply.Err = ErrNetwork
+			return nil
+		}
+	}
+
 	reply.Err = OK
 	kv.dedup[args.Xid] = cachedReply{Err: reply.Err}
 	return nil
@@ -138,6 +150,43 @@ func (kv *KVServer) Put(args PutAppendArgs, reply *PutAppendReply) error {
 /* ========================================================================
    Part 2.  Primary-Backup Replication
    ======================================================================== */
+
+/*
+callBackup sends one ForwardOp to the backup, dialing first if there is
+no cached connection.  On a transport error it closes and drops the
+connection so the next attempt redials.  Caller holds kv.mu.
+*/
+func (kv *KVServer) callBackup(args ForwardArgs, reply *ForwardReply) error {
+	if kv.backupClient == nil {
+		c, err := rpc.Dial("tcp", kv.backup)
+		if err != nil {
+			return err
+		}
+		kv.backupClient = c
+	}
+	if err := kv.backupClient.Call("KVServer.ForwardOp", args, reply); err != nil {
+		kv.backupClient.Close()
+		kv.backupClient = nil
+		return err
+	}
+	return nil
+}
+
+/*
+forwardToBackup re-sends args (same Xid) until the backup acks with OK.
+Returns false if this server is killed first.  Caller holds kv.mu, so
+the backup applies writes in the same order the primary did.
+*/
+func (kv *KVServer) forwardToBackup(args ForwardArgs) bool {
+	for !kv.isDead() {
+		var reply ForwardReply /* fresh each attempt: gob skips zero fields */
+		if err := kv.callBackup(args, &reply); err == nil && reply.Err == OK {
+			return true
+		}
+		time.Sleep(retryWait)
+	}
+	return false
+}
 
 /*
 EXPORTED
