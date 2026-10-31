@@ -411,6 +411,46 @@ func TestPrimaryWaitsForBackupAck(t *testing.T) {
 }
 
 /*
+Step 8: many clerks write to the same small set of keys at once.  If
+the backup applied writes in a different order than the primary, some
+key would end with a different value on each.  After the burst, every
+key must match on primary and backup.
+*/
+func TestBackupMatchesPrimaryAfterBurst(t *testing.T) {
+	backupAddr := "127.0.0.1:21405"
+	primaryAddr := "127.0.0.1:21406"
+	startServer(t, backupAddr, "")
+	startServer(t, primaryAddr, backupAddr)
+
+	const nClerks = 8
+	const nOps = 100
+	const nKeys = 5 /* few keys, so clerks collide on them */
+
+	var wg sync.WaitGroup
+	for c := 0; c < nClerks; c++ {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			ck := MakeClerk(primaryAddr)
+			for i := 0; i < nOps; i++ {
+				key := "k" + strconv.Itoa(i%nKeys)
+				ck.Put(key, fmt.Sprintf("c%d-%d", c, i))
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	for k := 0; k < nKeys; k++ {
+		key := "k" + strconv.Itoa(k)
+		p := directGet(t, primaryAddr, key, Xid(1000+k))
+		b := directGet(t, backupAddr, key, Xid(2000+k))
+		if p == "" || p != b {
+			t.Errorf("%s: primary = %q, backup = %q", key, p, b)
+		}
+	}
+}
+
+/*
 A smoke test.  Starts a single KVServer (no backup), writes a key,
 reads it back, and checks the value.  Passes once Part 1 is done.
 */
